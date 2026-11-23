@@ -103,6 +103,12 @@ def on_batch(state, batch):
 
     RIDER.note_bar(int(bar["c"]))
 
+    if holding is not None and RIDER.peak is None:
+        # A sell was rejected after the peak was cleared: re-arm the
+        # trailing stop from the latest close so the exit can retry
+        # instead of holding to the end of the window.
+        RIDER.peak = RIDER.closes[-1]
+
     if holding is not None:
         # We own CBBTC: leave only on a real give-back from the peak.
         if RIDER.dropped_below_peak():
