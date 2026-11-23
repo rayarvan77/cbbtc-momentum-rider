@@ -106,6 +106,18 @@ class Rider:
         latest = self.closes[-1]
         return (self.peak - latest) * 10_000 > self.peak * EXIT_DROP_BPS
 
+    def exit_reason(self):
+        """Why the open trade should close now: "take-profit" once the
+        close is 2% above the entry close, "trailing-stop" once it has
+        fallen 2% below the peak since entry, else None. The
+        take-profit check comes first, so a bar that clears both still
+        banks the gain instead of giving it back to the stop."""
+        if self.take_profit_hit():
+            return "take-profit"
+        if self.dropped_below_peak():
+            return "trailing-stop"
+        return None
+
     def cooling_down(self):
         """True while fewer than 60 bars have passed since the last sale
         was decided."""
@@ -147,7 +159,7 @@ def on_batch(state, batch):
     if holding is not None:
         # We own CBBTC: leave on a banked gain, or on a real give-back
         # from the peak. Either way the sale starts the cooldown.
-        if RIDER.take_profit_hit() or RIDER.dropped_below_peak():
+        if RIDER.exit_reason() is not None:
             RIDER.peak = None
             RIDER.last_sell_len = len(RIDER.closes)
             return [{
