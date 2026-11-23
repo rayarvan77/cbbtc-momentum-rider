@@ -1,102 +1,112 @@
-"""Momentum Rider: a long-only cbBTC (CBBTC/USDC) trading bot for
-agent-fun/bars-replay/v1, written for make.fun's "Race a BTC trading bot
-live for 24 hours" bounty.
+"""cbBTC momentum rider: a long-only, single-asset trading bot for the
+make.fun "Race a BTC trading bot live for 24 hours" competition.
 
-The idea, in one paragraph: one-minute BTC prices are mostly noise, and
-every round trip costs about 26 bps in fees, slippage and price impact,
-so a bot that trades on fast signals bleeds itself dry. This bot trades
-rarely and only in the direction of a real trend. It watches the return
-over the last two hours of one-minute closes; when that return clears a
-small positive bar it buys with all of its cash, and it stays in until
-the price falls 2% below the highest close seen since it bought. The
-same rule lets it back in after it is stopped out, so a genuine recovery
-is not missed, while a falling market mostly leaves it in cash. On the
-published dev window this makes about +$31 on $1,000 of paper money with
-a single trade and a maximum drawdown under 2%; on the same window run
-backwards (a falling market) it loses about $17 where buy-and-hold loses
-about $36, because it refuses to chase bounces.
+The idea is deliberately small. Coinbase Wrapped BTC usually drifts in
+quiet stretches and then jumps in short bursts, so this bot waits for a
+clear two-hour push before it buys, and it gets out as soon as the price
+gives back a meaningful part of its run-up. It holds at most one
+position, trades at most once per minute bar, and never uses leverage,
+shorts, the clock, the environment, or randomness: every decision is a
+pure function of the CBBTC closes the harness has sent so far.
 
-The bot is fully deterministic: no clock, no environment, no randomness.
-Every decision is a pure function of the bars the harness has sent so
-far, so two runs on the same data answer every batch with the same
-orders, byte for byte.
+Rules, in plain words:
+
+* Watch the CBBTC close of every minute bar and remember them all.
+* Flat: once at least 121 closes are known, compare the newest close
+  with the close 120 bars earlier. If it is up by more than 0.10%,
+  spend all available cash on CBBTC (a buy is skipped when the cash
+  left is under 1 USDC, the minimum notional).
+* Holding: keep the highest close seen since the entry. If the newest
+  close drops more than 2% below that peak, sell the whole position.
+  After a sale the entry rule applies again, so the bot can re-enter
+  on the next qualifying push.
+* Batches with no CBBTC bar, and warm-up batches, are ignored.
+
+The entrypoint is this file, run as ``python3 -P -s main.py``. It
+speaks agent-fun/bars-replay/v1 through the vendored shim in
+``vendor/makefun_bars.py`` (a byte-for-byte copy of the kit's Python
+shim), one reply per batch.
 """
 
 import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
+
 import makefun_bars
 
 SYMBOL = "CBBTC"
 
-# Smallest buy the replay accepts, in quote units (1 USDC).
-MIN_NOTIONAL = 1_000_000
-# How far back the trend is measured, in one-minute bars.
-TREND_BARS = 120
-# The two-hour return that counts as an uptrend worth joining (0.10%).
-TREND_ENTER = 0.001
-# How far the close may fall from its peak since entry before we exit.
-STOP_FRACTION = 0.02
-# Headroom allowed between the latest close and the fill price, in bps.
-# One-minute moves on this pool are under ~75 bps, so 200 bps never
-# binds in practice; it only guards against a wild bar.
+# How far back the momentum look-back reaches, in bars (two hours).
+MOMENTUM_BARS = 120
+# Entry needs a return strictly above this, in basis points (0.10%).
+ENTRY_MIN_BPS = 10
+# Exit when the latest close is more than this below the peak since
+# entry, in basis points (2%).
+EXIT_DROP_BPS = 200
+# Largest slippage the bot will tolerate on any fill, in basis points.
 MAX_SLIPPAGE_BPS = 200
+# Minimum cash (quote units) worth spending on a buy: 1 USDC.
+MIN_BUY_QUOTE_UNITS = 1_000_000
 
 
-class MomentumRider:
-    """Keeps the closes seen so far and the peak close since entry."""
+class Rider:
+    """The bot's memory: every CBBTC close seen, and the peak since entry."""
 
     def __init__(self):
         self.closes = []
         self.peak = None
 
-    def two_hour_return(self):
-        """Return of the latest close against the close 120 bars back."""
-        if len(self.closes) <= TREND_BARS:
-            return None
-        old = self.closes[-TREND_BARS - 1]
-        new = self.closes[-1]
-        return new / old - 1.0
-
-    def on_batch(self, state, batch):
-        """Decide the orders for one batch (one closed minute bar).
-
-        The hello, batch and orders flow is the harness's: hello once,
-        then one batch per minute, and this function answers every batch
-        with exactly one reply, echoing its seq, through the shim.
-        """
-        if state.warming_up:
-            return []
-        bars = [b for b in batch.get("bars", []) if b.get("symbol") == SYMBOL]
-        if not bars:
-            # A minute with no bar for our symbol carries no new
-            # information, so no decision is made on it.
-            return []
-        close = int(bars[-1]["c"])
+    def note_bar(self, close):
+        """Record one CBBTC close; while holding, refresh the peak."""
         self.closes.append(close)
-
-        holding = state.positions.get(SYMBOL)
-        if holding is None:
-            if state.cash < MIN_NOTIONAL:
-                # Not enough cash left for even the smallest buy.
-                return []
-            trend = self.two_hour_return()
-            if trend is not None and trend > TREND_ENTER:
-                self.peak = close
-                return [{
-                    "side": "buy",
-                    "symbol": SYMBOL,
-                    "notional_quote_units": state.cash,
-                    "max_slippage_bps": MAX_SLIPPAGE_BPS,
-                }]
-            return []
-
-        # We hold a position: track the peak and stop out below it.
-        if self.peak is None or close > self.peak:
+        if self.peak is not None and close > self.peak:
             self.peak = close
-        if close < self.peak * (1.0 - STOP_FRACTION):
-            self.peak = None
+
+    def momentum_above(self):
+        """True once at least 121 closes exist and the latest close sits
+        strictly more than 0.10% above the close 120 bars earlier.
+        Compared exactly in integers, so a return of 10.4 bps counts."""
+        if len(self.closes) <= MOMENTUM_BARS:
+            return False
+        now = self.closes[-1]
+        then = self.closes[-1 - MOMENTUM_BARS]
+        return now * 10_000 > then * (10_000 + ENTRY_MIN_BPS)
+
+    def dropped_below_peak(self):
+        """True while holding and the latest close has fallen strictly
+        more than 2% below the highest close since entry."""
+        if self.peak is None or not self.closes:
+            return False
+        latest = self.closes[-1]
+        return (self.peak - latest) * 10_000 > self.peak * EXIT_DROP_BPS
+
+
+RIDER = Rider()
+
+
+def on_batch(state, batch):
+    """Decide this minute's orders from the bars received so far."""
+    if state.warming_up:
+        return []
+
+    bar = state.latest.get(SYMBOL)
+    if bar is None:
+        # No CBBTC bar in this batch: nothing to learn, nothing to do.
+        return []
+
+    holding = state.positions.get(SYMBOL)
+    if holding is None and RIDER.peak is not None:
+        # A sale went through on the previous batch: the peak belongs to
+        # the closed trade, so forget it before judging a fresh entry.
+        RIDER.peak = None
+
+    RIDER.note_bar(int(bar["c"]))
+
+    if holding is not None:
+        # We own CBBTC: leave only on a real give-back from the peak.
+        if RIDER.dropped_below_peak():
+            RIDER.peak = None
             return [{
                 "side": "sell",
                 "symbol": SYMBOL,
@@ -105,11 +115,18 @@ class MomentumRider:
             }]
         return []
 
+    # Flat: buy the whole cash pile on a fresh two-hour push.
+    if not RIDER.momentum_above():
+        return []
+    if state.cash < MIN_BUY_QUOTE_UNITS:
+        return []
+    RIDER.peak = RIDER.closes[-1]
+    return [{
+        "side": "buy",
+        "symbol": SYMBOL,
+        "notional_quote_units": state.cash,
+        "max_slippage_bps": MAX_SLIPPAGE_BPS,
+    }]
 
-def main():
-    rider = MomentumRider()
-    makefun_bars.run(rider.on_batch)
 
-
-if __name__ == "__main__":
-    main()
+makefun_bars.run(on_batch)
